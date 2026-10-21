@@ -9,9 +9,11 @@ import safetensors.torch
 import torch
 from torch import nn
 
+from cosmos_framework.configs.base.defaults.quantization import QuantizationConfig
 from cosmos_framework.utils.generator.quantization import (
     apply_modelopt_fp8_checkpoint_inplace,
     is_modelopt_fp8_checkpoint,
+    quantize_per_layer_to_device,
 )
 
 
@@ -226,3 +228,39 @@ def test_apply_modelopt_fp8_checkpoint_uses_torchao_linear_dispatch(tmp_path: Pa
     assert torch.isfinite(compiled_reasoning_output).all()
     assert empty_output.shape == (0, 16)
     assert model.selected.weight.act_quant_scale.shape == (1, 1)
+
+
+def test_quantize_per_layer_to_device_never_holds_two_bf16_linears_on_device() -> None:
+    # "meta" stands in for the GPU so the loader logic runs on CPU; the torchao
+    # FP8 kernels themselves need CUDA (sm_89+) and are checked on a GPU only.
+    model = nn.Sequential(
+        *(
+            nn.Sequential(nn.Linear(8, 8, dtype=torch.bfloat16), nn.BatchNorm1d(8, dtype=torch.bfloat16))
+            for _ in range(3)
+        ),
+        nn.Linear(8, 8, dtype=torch.bfloat16),
+    )
+    config = QuantizationConfig(method="fp8", exclude_regex=[r"^3$"])
+    linears = [module for module in model.modules() if isinstance(module, nn.Linear)]
+    quantized: list[nn.Linear] = []
+
+    def fake_quantize(linear: nn.Linear, quantization_config: QuantizationConfig) -> None:
+        on_device_bf16 = [
+            module for module in linears if module.weight.is_meta and module.weight.dtype == torch.bfloat16
+        ]
+        assert on_device_bf16 == [linear]
+        assert quantization_config is config
+        linear.weight = nn.Parameter(linear.weight.to(torch.float8_e4m3fn), requires_grad=False)
+        quantized.append(linear)
+
+    matched = quantize_per_layer_to_device(model, config, "meta", quantize_linear=fake_quantize)
+
+    assert matched == ["0.0", "1.0", "2.0"]
+    assert quantized == linears[:3]
+    assert all(tensor.is_meta for tensor in [*model.parameters(), *model.buffers()])
+    assert model[3].weight.dtype == torch.bfloat16
+
+
+def test_quantize_per_layer_to_device_requires_a_method() -> None:
+    with pytest.raises(ValueError, match="method"):
+        quantize_per_layer_to_device(nn.Linear(4, 4), QuantizationConfig(), "meta")

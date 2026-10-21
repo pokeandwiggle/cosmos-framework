@@ -739,6 +739,82 @@ def _get_validated_quantization_fqns(model: nn.Module, filter_fn: Callable[[nn.M
     return matched_fqns
 
 
+def _torchao_config(quantization_config: QuantizationConfig) -> object:
+    """Return the torchao ``quantize_`` config for ``quantization_config.method``."""
+    from torchao.prototype.mx_formats import (
+        MXDynamicActivationMXWeightConfig,
+        NVFP4DynamicActivationNVFP4WeightConfig,
+    )
+    from torchao.quantization import (
+        Float8DynamicActivationFloat8WeightConfig,
+        PerRow,
+        PerTensor,
+    )
+
+    if quantization_config.method == "mxfp8":
+        return MXDynamicActivationMXWeightConfig()
+    if quantization_config.method == "nvfp4":
+        # use_triton_kernel=False avoids torchao's fused NVFP4 Triton kernel, which
+        # requires the external `mslk` package. Prebuilt mslk wheels are linked
+        # against upstream torch and fail to load against NVIDIA's NGC custom torch
+        # builds (ABI mismatch on `torch::Library::_def`), so we use torchao's
+        # built-in NVFP4 path instead.
+        return NVFP4DynamicActivationNVFP4WeightConfig(use_triton_kernel=False)
+    if quantization_config.method == "fp8":
+        # Hopper-compatible FP8. Unlike mxfp8 / nvfp4 (block-scaled MX / NVFP4
+        # formats whose accelerated kernels require Blackwell sm_100 tensor
+        # cores), this is plain e4m3 dynamic-activation + fp8-weight quantization
+        # executed via torch._scaled_mm, which is supported on Hopper (sm_90) and
+        # Ada (sm_89). Scaling granularity is user-selectable: PerRow (rowwise,
+        # better accuracy) or PerTensor (single scale, slightly faster); both are
+        # supported on Hopper.
+        granularity = PerRow() if quantization_config.fp8_granularity == "per_row" else PerTensor()
+        return Float8DynamicActivationFloat8WeightConfig(granularity=granularity)
+    raise ValueError(f"Unsupported quantization method: {quantization_config.method}")
+
+
+def _quantize_linear(linear: nn.Linear, quantization_config: QuantizationConfig) -> None:
+    """Quantize one ``nn.Linear`` in place with torchao."""
+    from torchao.quantization import quantize_
+
+    quantize_(linear, config=_torchao_config(quantization_config))
+
+
+def quantize_per_layer_to_device(
+    model: nn.Module,
+    quantization_config: QuantizationConfig,
+    device: torch.device | str,
+    quantize_linear: Callable[[nn.Linear, QuantizationConfig], None] = _quantize_linear,
+) -> list[str]:
+    """Move a host-resident model to ``device`` one module at a time, quantizing as it goes.
+
+    Each module's own parameters and buffers move to ``device``; a selected linear is
+    quantized right after its bf16 weight lands, which frees that bf16 copy. The
+    device therefore never holds more than the weights moved so far, quantized
+    where selected, plus one bf16 module, rather than the full bf16 model that
+    :func:`apply_quantization_inplace` starts from.
+
+    Args:
+        model: Unsharded model whose parameters live on the host.
+        quantization_config: Method and module selection, as for
+            :func:`apply_quantization_inplace`.
+        device: Target device.
+        quantize_linear: Quantizes one linear in place. Defaults to torchao.
+
+    Returns:
+        Sorted fully qualified names of the quantized modules.
+    """
+    if quantization_config.method is None:
+        raise ValueError("quantize_per_layer_to_device requires quantization_config.method")
+    matched_fqns = set(_get_validated_quantization_fqns(model, _get_filter_fn(quantization_config)))
+    for fqn, module in model.named_modules():
+        module._apply(lambda tensor: tensor.to(device), recurse=False)
+        if fqn in matched_fqns:
+            quantize_linear(module, quantization_config)
+    log.info(f"Moved to {device} per layer with method={quantization_config.method}, matched_count={len(matched_fqns)}")
+    return sorted(matched_fqns)
+
+
 def apply_quantization_inplace(model: nn.Module, quantization_config: QuantizationConfig) -> list[str]:
     """Apply quantization in place via ``quantize_`` (replaces weights with quantized tensors).
 
@@ -765,17 +841,6 @@ def apply_quantization_inplace(model: nn.Module, quantization_config: Quantizati
     filter_fn = _get_filter_fn(quantization_config)
     matched_fqns = _get_validated_quantization_fqns(model, filter_fn)
 
-    from torchao.prototype.mx_formats import (
-        MXDynamicActivationMXWeightConfig,
-        NVFP4DynamicActivationNVFP4WeightConfig,
-    )
-    from torchao.quantization import (
-        Float8DynamicActivationFloat8WeightConfig,
-        PerRow,
-        PerTensor,
-        quantize_,
-    )
-
     def _reclaim_and_log_gpu_memory(tag: str) -> None:
         # synchronize() + gc.collect() + empty_cache() are load-bearing, not passive
         # observability: torch.mem_get_info reports memory free at the CUDA-driver level.
@@ -792,42 +857,9 @@ def apply_quantization_inplace(model: nn.Module, quantization_config: Quantizati
 
     _reclaim_and_log_gpu_memory("before quantization")
 
-    if quantization_config.method == "mxfp8":
-        quantize_(
-            model,
-            config=MXDynamicActivationMXWeightConfig(),
-            filter_fn=filter_fn,
-        )
+    from torchao.quantization import quantize_
 
-    elif quantization_config.method == "nvfp4":
-        # use_triton_kernel=False avoids torchao's fused NVFP4 Triton kernel, which
-        # requires the external `mslk` package. Prebuilt mslk wheels are linked
-        # against upstream torch and fail to load against NVIDIA's NGC custom torch
-        # builds (ABI mismatch on `torch::Library::_def`), so we use torchao's
-        # built-in NVFP4 path instead.
-        quantize_(
-            model,
-            config=NVFP4DynamicActivationNVFP4WeightConfig(use_triton_kernel=False),
-            filter_fn=filter_fn,
-        )
-
-    elif quantization_config.method == "fp8":
-        # Hopper-compatible FP8. Unlike mxfp8 / nvfp4 (block-scaled MX / NVFP4
-        # formats whose accelerated kernels require Blackwell sm_100 tensor
-        # cores), this is plain e4m3 dynamic-activation + fp8-weight quantization
-        # executed via torch._scaled_mm, which is supported on Hopper (sm_90) and
-        # Ada (sm_89). Scaling granularity is user-selectable: PerRow (rowwise,
-        # better accuracy) or PerTensor (single scale, slightly faster); both are
-        # supported on Hopper.
-        granularity = PerRow() if quantization_config.fp8_granularity == "per_row" else PerTensor()
-        quantize_(
-            model,
-            config=Float8DynamicActivationFloat8WeightConfig(granularity=granularity),
-            filter_fn=filter_fn,
-        )
-
-    else:
-        raise ValueError(f"Unsupported quantization method: {quantization_config.method}")
+    quantize_(model, config=_torchao_config(quantization_config), filter_fn=filter_fn)
 
     _reclaim_and_log_gpu_memory("after quantization")
     log.info(f"Applied runtime PTQ method={quantization_config.method}, matched_count={len(matched_fqns)}")

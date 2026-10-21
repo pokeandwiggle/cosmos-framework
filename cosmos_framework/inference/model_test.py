@@ -13,6 +13,7 @@ import pytest
 import safetensors.torch
 import torch
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.api import CheckpointException
 from torch.distributed.checkpoint.metadata import Metadata, TensorProperties, TensorStorageMetadata
 
 from cosmos_framework.configs.base.defaults.compile import CompileConfig
@@ -153,6 +154,58 @@ def test_diffusers_dcp_load_remaps_nested_safetensors(tmp_path: Path):
     torch.testing.assert_close(target["model.net._orig_mod.vae2llm.weight"], source)
 
 
+def _write_diffusers_checkpoint(path: Path, tensors: dict[str, torch.Tensor]) -> None:
+    shard_rel_path = "transformer/diffusion_pytorch_model.safetensors"
+    (path / "transformer").mkdir(parents=True)
+    safetensors.torch.save_file(tensors, path / shard_rel_path)
+    weight_map = dict.fromkeys(tensors, shard_rel_path)
+    (path / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
+
+
+def test_diffusers_overlay_loads_only_the_changed_tensors_over_the_base(tmp_path: Path) -> None:
+    base, export = tmp_path / "base", tmp_path / "export"
+    _write_diffusers_checkpoint(base, {"proj_in.weight": torch.zeros(2, 3), "proj_out.weight": torch.zeros(3, 2)})
+    _write_diffusers_checkpoint(export, {"proj_out.weight": torch.ones(3, 2)})
+    target = {"vae2llm.weight": torch.full((2, 3), 7.0), "llm2vae.weight": torch.full((3, 2), 7.0)}
+
+    with pytest.raises(CheckpointException, match="did not provide 1 required"):
+        dcp.load(
+            state_dict=target,
+            storage_reader=_DiffusersHuggingFaceStorageReader(export),
+            planner=_DiffusersLoadPlanner(export),
+        )
+    for path, overlay in ((base, False), (export, True)):
+        dcp.load(
+            state_dict=target,
+            storage_reader=_DiffusersHuggingFaceStorageReader(path),
+            planner=_DiffusersLoadPlanner(path, overlay=overlay),
+        )
+
+    torch.testing.assert_close(target["vae2llm.weight"], torch.zeros(2, 3))
+    torch.testing.assert_close(target["llm2vae.weight"], torch.ones(3, 2))
+
+
+def test_from_pretrained_dcp_loads_the_base_before_the_export(tmp_path: Path) -> None:
+    loads: list[tuple[str, bool]] = []
+
+    def record_load(*, planner: _DiffusersLoadPlanner, **_: object) -> None:
+        loads.append((planner.checkpoint_path.name, planner.overlay))
+
+    base, export = tmp_path / "base", tmp_path / "export"
+    _write_diffusers_checkpoint(base, {"proj_in.weight": torch.zeros(2, 3)})
+    _write_diffusers_checkpoint(export, {"proj_in.weight": torch.ones(2, 3)})
+    with (
+        patch.object(CheckpointType, "from_path", return_value=CheckpointType.HF),
+        patch("cosmos_framework.inference.model.get_model_state_dict", return_value={}),
+        patch("cosmos_framework.inference.model.dcp.load", side_effect=record_load),
+    ):
+        LightweightDcpModel.from_pretrained_dcp(
+            checkpoint_path=export, config=Cosmos3OmniConfig(), base_checkpoint_path=base
+        )
+
+    assert loads == [("base", False), ("export", True)]
+
+
 class LightweightDcpModel(Cosmos3OmniModel):
     """Skip the hydra model build so the checkpoint-loading plumbing can be tested on CPU."""
 
@@ -225,6 +278,53 @@ def test_from_pretrained_dcp_installs_modelopt_fp8_after_load(tmp_path: Path) ->
 
     assert events == ["load", "modelopt"]
     assert converted_targets == [model.model.net]
+
+
+def test_from_pretrained_dcp_quantizes_per_layer_after_the_host_load(tmp_path: Path) -> None:
+    events: list[str] = []
+    quantization_config = QuantizationConfig(method="fp8", quantize_per_layer_at_load=True)
+
+    def record_quantize(model: object, config: QuantizationConfig, device: object) -> list[str]:
+        del device
+        assert config is quantization_config
+        events.append("quantize")
+        return []
+
+    with (
+        patch.object(CheckpointType, "from_path", return_value=CheckpointType.HF),
+        patch("cosmos_framework.inference.model._is_diffusers_checkpoint", return_value=True),
+        patch("cosmos_framework.inference.model.is_modelopt_fp8_checkpoint", return_value=False),
+        patch("cosmos_framework.inference.model.get_model_state_dict", return_value={}),
+        patch("cosmos_framework.inference.model._DiffusersHuggingFaceStorageReader"),
+        patch("cosmos_framework.inference.model._DiffusersLoadPlanner"),
+        patch("cosmos_framework.inference.model.dcp.load", side_effect=lambda **_: events.append("load")),
+        patch("cosmos_framework.inference.model.quantize_per_layer_to_device", side_effect=record_quantize),
+    ):
+        LightweightDcpModel.from_pretrained_dcp(
+            checkpoint_path=tmp_path, config=Cosmos3OmniConfig(), quantization_config=quantization_config
+        )
+
+    assert events == ["load", "quantize"]
+
+
+@pytest.mark.parametrize(
+    ("quantization_config", "modelopt", "message"),
+    [
+        (QuantizationConfig(quantize_per_layer_at_load=True), False, "requires a quantization method"),
+        (QuantizationConfig(method="fp8", quantize_per_layer_at_load=True), True, "already quantized"),
+    ],
+)
+def test_from_pretrained_dcp_refuses_per_layer_load_it_cannot_do(
+    tmp_path: Path, quantization_config: QuantizationConfig, modelopt: bool, message: str
+) -> None:
+    with (
+        patch("cosmos_framework.inference.model._is_diffusers_checkpoint", return_value=True),
+        patch("cosmos_framework.inference.model.is_modelopt_fp8_checkpoint", return_value=modelopt),
+        pytest.raises(ValueError, match=message),
+    ):
+        LightweightDcpModel.from_pretrained_dcp(
+            checkpoint_path=tmp_path, config=Cosmos3OmniConfig(), quantization_config=quantization_config
+        )
 
 
 def test_from_pretrained_dcp_rejects_modelopt_fp8_with_runtime_quantization(tmp_path: Path) -> None:

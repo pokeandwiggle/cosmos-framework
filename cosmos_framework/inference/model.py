@@ -44,11 +44,12 @@ from cosmos_framework.inference.common.public_model_config import (
     restore_model_config_from_public_model_config,
 )
 from cosmos_framework.utils import misc
-from cosmos_framework.utils.flags import SMOKE
+from cosmos_framework.utils.flags import DEVICE, SMOKE
 from cosmos_framework.utils.generator.quantization import (
     apply_modelopt_fp8_checkpoint_inplace,
     is_modelopt_fp8_checkpoint,
     plan_modelopt_fp8_targets,
+    quantize_per_layer_to_device,
 )
 
 if TYPE_CHECKING:
@@ -456,14 +457,19 @@ class _DiffusersLoadPlanner(dcp.DefaultLoadPlanner):
         checkpoint_path: Path,
         *,
         defer_modelopt_fp8_weights_loading: bool = False,
+        overlay: bool = False,
     ) -> None:
         """Initialize the planner.
 
         When ``defer_modelopt_fp8_weights_loading`` is enabled, ModelOpt FP8
         weight tensors are omitted from the DCP load so they can be installed
         directly as TorchAO weights after the remaining checkpoint is loaded.
+
+        When ``overlay`` is enabled, the checkpoint may carry any subset of the
+        model's tensors: it is loaded over weights that are already in place.
         """
         super().__init__()
+        self.overlay = overlay
         self.checkpoint_path = checkpoint_path
         self.weight_map = _diffusers_weight_map(checkpoint_path)
         self.files_to_keys = _diffusers_files_to_keys(self.weight_map)
@@ -490,7 +496,7 @@ class _DiffusersLoadPlanner(dcp.DefaultLoadPlanner):
             }
         remapped_state_dict, loaded_keys, skipped_target_keys = self._build_remapped_state_dict(target_state_dict)
 
-        missing_keys = set(target_state_dict) - loaded_keys - skipped_target_keys
+        missing_keys = set() if self.overlay else set(target_state_dict) - loaded_keys - skipped_target_keys
         if not self.has_vision_weights:
             missing_keys = {key for key in missing_keys if not key.startswith("language_model.visual.")}
         # Task-specialized checkpoints (e.g. Text2Image, Image2Video) omit the
@@ -668,7 +674,22 @@ class Cosmos3OmniModel(transformers.PreTrainedModel):
         parallelism_config: ParallelismConfig | None = None,
         compile_config: CompileConfig | None = None,
         quantization_config: QuantizationConfig | None = None,
+        base_checkpoint_path: Path | None = None,
     ):
+        """Build the model and load ``checkpoint_path`` into it.
+
+        Args:
+            base_checkpoint_path: A complete bf16 diffusers checkpoint loaded first.
+                ``checkpoint_path`` is then loaded over it and may carry only the
+                tensors it changes, as a fine-tune export that leaves the base
+                untouched elsewhere does. Both must be diffusers-format.
+        """
+        if base_checkpoint_path is not None and not (
+            _is_diffusers_checkpoint(base_checkpoint_path) and _is_diffusers_checkpoint(checkpoint_path)
+        ):
+            raise ValueError(
+                f"base_checkpoint_path requires diffusers-format checkpoints: {base_checkpoint_path}, {checkpoint_path}"
+            )
         if config is None:
             config = Cosmos3OmniConfig.from_pretrained(checkpoint_path)
         if parallelism_config is None:
@@ -709,6 +730,17 @@ class Cosmos3OmniModel(transformers.PreTrainedModel):
                 weight_map=_diffusers_weight_map(checkpoint_path),
             )
 
+        if quantization_config.quantize_per_layer_at_load:
+            _dist = torch.distributed
+            if quantization_config.method is None:
+                raise ValueError("quantize_per_layer_at_load requires a quantization method")
+            if modelopt_checkpoint or not _is_diffusers_checkpoint(checkpoint_path):
+                raise ValueError(
+                    f"quantize_per_layer_at_load requires a bf16 diffusers-format checkpoint: {checkpoint_path}"
+                )
+            if _dist.is_available() and _dist.is_initialized() and _dist.get_world_size() > 1:
+                raise ValueError("quantize_per_layer_at_load supports a single replicated rank only")
+
         model = cls(config)
         # Thread the local checkpoint dir to the reasoner LM (consumed by Edge's
         # lazy ``_ensure_vision_tower``): checkpoints that bundle a
@@ -731,12 +763,22 @@ class Cosmos3OmniModel(transformers.PreTrainedModel):
                     # code objects"). no_dist loads locally without collectives.
                     _dist = torch.distributed
                     no_dist = not (_dist.is_available() and _dist.is_initialized() and _dist.get_world_size() > 1)
+                    if base_checkpoint_path is not None:
+                        if modelopt_checkpoint:
+                            raise ValueError("base_checkpoint_path cannot be combined with a ModelOpt FP8 checkpoint")
+                        dcp.load(
+                            state_dict=state_dict,
+                            storage_reader=_DiffusersHuggingFaceStorageReader(base_checkpoint_path),
+                            planner=_DiffusersLoadPlanner(base_checkpoint_path),
+                            no_dist=no_dist,
+                        )
                     dcp.load(
                         state_dict=state_dict,
                         storage_reader=_DiffusersHuggingFaceStorageReader(checkpoint_path),
                         planner=_DiffusersLoadPlanner(
                             checkpoint_path,
                             defer_modelopt_fp8_weights_loading=modelopt_checkpoint,
+                            overlay=base_checkpoint_path is not None,
                         ),
                         no_dist=no_dist,
                     )
@@ -757,6 +799,9 @@ class Cosmos3OmniModel(transformers.PreTrainedModel):
                         )
 
                         install_mixed_precision_runtime(model.model.net, quantization_config)
+                    if quantization_config.quantize_per_layer_at_load:
+                        # build_net left the network on the host, now loaded.
+                        quantize_per_layer_to_device(model.model.net, quantization_config, DEVICE)
                     return model
                 state_dict = get_model_state_dict(model)
                 _raise_on_missing_vision_keys(checkpoint_path, state_dict)

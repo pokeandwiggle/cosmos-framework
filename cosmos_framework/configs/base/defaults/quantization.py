@@ -59,6 +59,14 @@ class QuantizationConfig:
     # the config so the meta-device swap in ``build_net`` needs no mapper.
     modelopt_fp8_target_fqns: list[str] = attrs.field(factory=list)
 
+    # Runtime quantization while loading, for a GPU that cannot hold the bf16
+    # weights. The network is materialized and loaded on the host, then moved to
+    # the GPU one module at a time, each selected linear quantized as it lands,
+    # so the GPU never holds more than the quantized weights plus one bf16
+    # module. Requires ``method``; supported by the diffusers checkpoint path of
+    # ``Cosmos3OmniModel.from_pretrained_dcp`` on a single replicated rank.
+    quantize_per_layer_at_load: bool = attrs.field(default=False)
+
     # Mixed-precision diffusion steps for ModelOpt FP8 checkpoints: the first
     # ``mixed_precision_first_steps`` and last ``mixed_precision_last_steps``
     # denoising steps run generation-path linears with 16-bit activations
