@@ -15,10 +15,12 @@ to ``RankPartitionedDataLoader`` (mirroring how the vision recipe uses
 
 from __future__ import annotations
 
-from typing import Any
+from torch.utils.data import Dataset
 
-from torch.utils.data import Dataset, IterableDataset, get_worker_info
-
+from cosmos_framework.data.generator.action.datasets.action_sft_wrappers import (
+    ActionIterableShuffleDataset,
+    ActionSFTDataset,
+)
 from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset import DROIDLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.droid_merged_lerobot_dataset import DROIDMergedLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.libero_lerobot_dataset import LIBEROLeRobotDataset
@@ -27,70 +29,6 @@ from cosmos_framework.data.generator.action.datasets.robocasa_lerobot_dataset im
     RoboCasaLeRobotDataset,
 )
 from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
-
-
-class ActionSFTDataset(Dataset):
-    """Wraps a map-style action dataset and applies ``ActionTransformPipeline`` per sample."""
-
-    def __init__(self, dataset: Dataset, transform: ActionTransformPipeline, resolution: str | int | None):
-        super().__init__()
-        self._dataset = dataset
-        self._transform = transform
-        self._resolution = resolution
-
-    def __len__(self) -> int:
-        return len(self._dataset)
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        return self._transform(self._dataset[idx], self._resolution)
-
-    def get_shuffle_blocks(self):
-        """Delegate to the inner DROIDLeRobotDataset (per-episode/segment flat-index blocks)."""
-        return self._dataset.get_shuffle_blocks()
-
-
-class ActionIterableShuffleDataset(IterableDataset):
-    """Streaming view of a map-style ``ActionSFTDataset``.
-
-    Each ``(rank, worker)`` is assigned a DISJOINT subset of episodes (sharded over
-    ``shard_world_size * num_workers``), shuffles its episode ORDER, and streams the
-    windows WITHIN each episode sequentially -> within-rank batch diversity (the N
-    workers of a rank stream N different episodes) AND cross-rank diversity, while
-    keeping reads sequential (I/O locality + COW; no RandomSampler random-access OOM).
-    Re-shuffles each epoch and streams indefinitely (the trainer stops at ``max_iter``).
-
-    ``shard_world_size`` / ``shard_rank`` are set by ``RankPartitionedDataLoader``.
-    """
-
-    def __init__(self, dataset: "ActionSFTDataset", seed: int = 42):
-        super().__init__()
-        self._dataset = dataset
-        self._seed = int(seed)
-        self.shard_world_size = 1
-        self.shard_rank = 0
-
-    def __len__(self) -> int:  # informational only; iteration is infinite
-        return len(self._dataset)
-
-    def __iter__(self):
-        import torch
-
-        blocks = self._dataset.get_shuffle_blocks()
-        wi = get_worker_info()
-        wid = wi.id if wi is not None else 0
-        nw = wi.num_workers if wi is not None else 1
-        global_shard = int(self.shard_rank) * nw + wid
-        total_shards = max(1, int(self.shard_world_size) * nw)
-        epoch = 0
-        while True:
-            g = torch.Generator()
-            g.manual_seed(self._seed + epoch)  # same permutation across all (rank,worker) -> disjoint shard
-            order = torch.randperm(len(blocks), generator=g).tolist()
-            for b in order[global_shard::total_shards]:
-                start, length = blocks[b]
-                for idx in range(start, start + length):
-                    yield self._dataset[idx]
-            epoch += 1
 
 
 def get_action_droid_sft_dataset(
