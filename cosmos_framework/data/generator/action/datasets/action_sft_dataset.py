@@ -27,6 +27,7 @@ from cosmos_framework.data.generator.action.datasets.robocasa_lerobot_dataset im
     RoboCasaLeRobotDataset,
 )
 from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
+from cosmos_framework.utils.lazy_config.registry import locate
 
 
 class ActionSFTDataset(Dataset):
@@ -368,6 +369,39 @@ def get_action_libero_sft_dataset(
         format_prompt_as_json=format_prompt_as_json,
     )
     sft = ActionSFTDataset(dataset, transform, resolution)
+    if iterable_shuffle:
+        return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
+    return sft
+
+
+def get_action_external_sft_dataset(
+    *,
+    dataset_class: str,
+    dataset_kwargs: dict[str, Any],
+    resolution: str | int,
+    transform_kwargs: dict[str, Any] | None = None,
+    iterable_shuffle: bool = False,
+    episode_shuffle_seed: int = 42,
+) -> Dataset:
+    """Build an action SFT dataset around a dataset class named by import path.
+
+    Lets a downstream package train on its own recordings without adding a dataset
+    to this repository: its class only has to return the raw sample that
+    ``DROIDLeRobotDataset.__getitem__`` returns (``video``/``action``/``ai_caption``/
+    ``viewpoint``/``mode``/``domain_id``/...), and ``get_shuffle_blocks()`` when
+    ``iterable_shuffle`` is set.
+
+    Args:
+        dataset_class: Import path of the map-style dataset class, e.g.
+            ``"my_package.recordings.RecordingDataset"``.
+        dataset_kwargs: Keyword arguments for ``dataset_class``.
+        resolution: Resolution bucket passed to ``ActionTransformPipeline``.
+        transform_kwargs: Keyword arguments for ``ActionTransformPipeline``.
+        iterable_shuffle: Stream through ``ActionIterableShuffleDataset``.
+        episode_shuffle_seed: Seed of the episode-order shuffle.
+    """
+    dataset: Dataset = locate(dataset_class)(**dataset_kwargs)
+    sft = ActionSFTDataset(dataset, ActionTransformPipeline(**(transform_kwargs or {})), resolution)
     if iterable_shuffle:
         return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
     return sft
