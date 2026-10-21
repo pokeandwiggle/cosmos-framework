@@ -108,9 +108,24 @@ def build_action_batch(
     input_video_key: str,
     batch_size: int = 1,
     device: Any = "cuda",
+    action_prefix: torch.Tensor | None = None,
 ) -> dict:
-    """Build an Action data batch from pre-loaded video and action tensors."""
+    """Build an Action data batch from pre-loaded video and action tensors.
+
+    Args:
+        action_prefix: Real-time-chunking prefix ``[d,raw_action_dim]``, ``wam`` only:
+            the actions the robot has already committed to, in the model's action
+            space. They become the chunk's first ``d`` rows as clean conditioning,
+            and sampling returns them unchanged.
+    """
     target_frames = action_chunk_size + 1
+    rtc_delay = 0
+    if action_prefix is not None:
+        if model_mode is not ModelMode.WAM:
+            raise ValueError(f"action_prefix requires model_mode=wam, got {model_mode.value}")
+        rtc_delay, prefix_dim = action_prefix.shape
+        if prefix_dim != raw_action_dim:
+            raise ValueError(f"action_prefix has {prefix_dim} channels, expected raw_action_dim={raw_action_dim}")
     _, num_frames, h, w = video.shape
 
     if num_frames < target_frames:
@@ -133,7 +148,11 @@ def build_action_batch(
         video_length=target_frames,
         action_length=action_chunk_size,
         has_text=True,
+        rtc_delay=rtc_delay,
     )
+    if action_prefix is not None:
+        action = action.clone()  # [T,D_max]
+        action[:rtc_delay, :raw_action_dim] = action_prefix.to(action)
 
     ai_caption = _format_prompt(
         prompt=prompt,

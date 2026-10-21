@@ -12,11 +12,13 @@ from cosmos_framework.data.generator.action.utils.json_formatter import ActionPr
 from cosmos_framework.data.generator.action.utils.transforms import (
     ActionTransformPipeline,
     add_action_mode_metadata,
+    build_sequence_plan_from_mode,
     reflection_pad_to_target,
     remove_reflection_padding,
 )
 from cosmos_framework.data.generator.augmentors.duration_fps_text_timestamps import DurationFPSTextTimeStamps
 from cosmos_framework.data.generator.augmentors.resolution_text_info import ResolutionTextInfo
+from cosmos_framework.data.generator.sequence_packing.sequence import PackedSequenceBuilder
 
 
 @pytest.mark.L0
@@ -636,3 +638,98 @@ def test_action_prompt_json_formatter_matches_video_json_common_metadata() -> No
     assert action_prompt["actions"][0]["time"] == video_prompt["actions"][0]["time"]
     assert action_prompt["actions"][0]["description"] == video_prompt["actions"][0]["description"]
     assert action_prompt["actions"][0]["idle_frame"] == "3 out of 22."
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("video_length", "action_length", "num_history_actions", "expected"),
+    [
+        (33, 32, 0, [0, 1, 2, 3, 4]),  # dense video: no initial-state action
+        (33, 33, 0, [0, 1, 2, 3, 4, 5]),  # use_state: the initial state stays conditioning
+        (33, 34, 2, [0, 1, 2, 3, 4, 5, 6]),  # history block comes first
+    ],
+)
+def test_rtc_delay_marks_the_first_predicted_actions_as_conditioning(
+    video_length: int, action_length: int, num_history_actions: int, expected: list[int]
+) -> None:
+    plan = build_sequence_plan_from_mode(
+        mode="wam",
+        video_length=video_length,
+        action_length=action_length,
+        num_history_actions=num_history_actions,
+        rtc_delay=5,
+    )
+
+    assert plan.condition_frame_indexes_action == expected
+
+
+@pytest.mark.L0
+def test_rtc_delay_is_refused_where_it_cannot_apply() -> None:
+    with pytest.raises(ValueError, match="'wam' and 'policy'"):
+        build_sequence_plan_from_mode(mode="forward_dynamics", video_length=33, action_length=32, rtc_delay=1)
+    with pytest.raises(ValueError, match="1..32"):
+        build_sequence_plan_from_mode(mode="wam", video_length=33, action_length=32, rtc_delay=33)
+    with pytest.raises(ValueError, match="rtc_max_delay"):
+        ActionTransformPipeline(rtc_max_delay=-1)
+
+
+@pytest.mark.L0
+def test_rtc_training_keeps_the_prefix_out_of_the_action_loss() -> None:
+    torch.manual_seed(0)
+    pipeline = ActionTransformPipeline(
+        tokenizer_config=None,
+        max_action_dim=32,
+        append_viewpoint_info=False,
+        append_duration_fps_timestamps=False,
+        append_resolution_info=False,
+        rtc_max_delay=15,
+    )
+    delays = []
+    for _ in range(200):
+        data_dict = {
+            "ai_caption": "Fold the towel.",
+            "video": torch.zeros(3, 33, 64, 64),
+            "action": torch.zeros(32, 20),
+            "mode": "wam",
+            "domain_id": torch.tensor(12),
+        }
+        plan = pipeline(data_dict, resolution="256")["sequence_plan"]
+        delay = len(plan.condition_frame_indexes_action)
+        assert plan.condition_frame_indexes_action == list(range(delay))
+
+        builder = PackedSequenceBuilder()
+        builder.begin_sample(0)
+        builder.pack_action_tokens(
+            torch.zeros(32, 32),  # [T,D]
+            condition_frame_indexes_action=plan.condition_frame_indexes_action,
+            input_timestep=0.5,
+            action_start_frame_offset=plan.action_start_frame_offset,
+        )
+        assert builder.action is not None
+        assert builder.action.condition_mask[0].squeeze(1).tolist() == [1.0] * delay + [0.0] * (32 - delay)
+        assert builder.action.noisy_frame_indexes[0].tolist() == list(range(delay, 32))
+        assert len(builder.action.mse_loss_indexes) == 32 - delay
+        delays.append(delay)
+
+    assert min(delays) == 0 and max(delays) == 15
+
+
+@pytest.mark.L0
+def test_rtc_training_leaves_other_modes_alone() -> None:
+    pipeline = ActionTransformPipeline(
+        tokenizer_config=None,
+        max_action_dim=32,
+        append_viewpoint_info=False,
+        append_duration_fps_timestamps=False,
+        append_resolution_info=False,
+        rtc_max_delay=15,
+    )
+    data_dict = {
+        "ai_caption": "Fold the towel.",
+        "video": torch.zeros(3, 33, 64, 64),
+        "action": torch.zeros(32, 20),
+        "mode": "inverse_dynamics",
+        "domain_id": torch.tensor(12),
+    }
+
+    assert pipeline(data_dict, resolution="256")["sequence_plan"].condition_frame_indexes_action == []

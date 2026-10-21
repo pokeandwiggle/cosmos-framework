@@ -190,6 +190,28 @@ def _uses_lidar_primary_tokenizer(data_batch: dict[str, Any]) -> bool:
     return value == "lidar"
 
 
+def keep_condition_values(
+    latents: list[torch.Tensor],
+    condition_reference: list[torch.Tensor],
+    condition_mask: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    """Return sampled latents with every conditioning value restored verbatim.
+
+    The network's velocity is zero on conditioning tokens, which keeps them fixed
+    only up to the solver's round-off. Clean frames and a real-time-chunking action
+    prefix must leave the sampler exactly as given, so they are copied back.
+
+    Args:
+        latents: Sampled latents, one flattened ``[N_i]`` tensor per sample.
+        condition_reference: Clean values, same shapes as ``latents``.
+        condition_mask: 1 where the value is conditioning, same shapes as ``latents``.
+    """
+    return [
+        torch.where(mask.to(device=latent.device) > 0, reference.to(latent), latent)
+        for latent, reference, mask in zip(latents, condition_reference, condition_mask, strict=True)
+    ]
+
+
 def _vision_condition_masks(packed_sequence: PackedSequence) -> list[torch.Tensor]:
     """Per-vision-item condition masks, empty when the batch generates no camera stream.
 
@@ -4609,6 +4631,8 @@ class OmniMoTModel(ImaginaireModel):
             finally:
                 if _mixed_precision_runtime is not None:
                     _mixed_precision_runtime.reset()
+
+            latents = keep_condition_values(latents, condition_reference, condition_mask)
 
             # Split flattened latents back into vision latents, LiDAR latents, radar latents,
             # external actions, and sound latents. Mirror the per-sample logic from
