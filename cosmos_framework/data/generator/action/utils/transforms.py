@@ -284,6 +284,7 @@ def build_sequence_plan_from_mode(
     has_text: bool = True,
     video_temporal_downsample: int = 4,
     num_history_actions: int = 0,
+    rtc_delay: int = 0,
 ) -> SequencePlan:
     """Build a SequencePlan based on the training mode.
 
@@ -302,6 +303,12 @@ def build_sequence_plan_from_mode(
         video_temporal_downsample: Temporal downsampling factor of the video
             tokenizer. Used to compute condition frame indexes for inverse
             dynamics mode. Defaults to 4.
+        num_history_actions: Number of prepended ground-truth history actions.
+        rtc_delay: Real-time chunking prefix length. The first ``rtc_delay``
+            predicted action steps (after history and initial state) are marked
+            as clean conditioning: they get sigma = 0 and stay out of the action
+            loss, as a robot that replans mid-chunk has already committed to
+            them. Only valid for ``"wam"`` and ``"policy"``. Defaults to 0.
 
     Returns:
         SequencePlan instance with appropriate settings.
@@ -380,6 +387,16 @@ def build_sequence_plan_from_mode(
         condition_frame_indexes_action = list(
             range(num_history_actions + 1 if has_initial_state else num_history_actions)
         )
+
+    if rtc_delay:
+        if mode not in ("wam", "policy"):
+            raise ValueError(f"rtc_delay applies only to 'wam' and 'policy' modes, got mode={mode!r}")
+        first_predicted = len(condition_frame_indexes_action)
+        if not 0 < rtc_delay <= action_length - first_predicted:
+            raise ValueError(
+                f"rtc_delay={rtc_delay} must be in 1..{action_length - first_predicted} (the predicted action steps)"
+            )
+        condition_frame_indexes_action += range(first_predicted, first_predicted + rtc_delay)
 
     # `action_start_frame_offset` shifts the action stream so that the first
     # non-conditioning action aligns with video frame index 1 (the first
@@ -553,6 +570,12 @@ class ActionTransformPipeline:
             instead of truncated whole seconds ("0s").  Useful for short
             high-fps clips.  No effect unless JSON prompts are on.  Defaults to
             ``False``.
+        rtc_max_delay: Train for real-time chunking. Each ``"wam"`` or
+            ``"policy"`` sample draws a delay ``d`` uniformly from
+            ``0..rtc_max_delay`` and keeps its first ``d`` predicted action steps
+            clean, as committed conditioning (see
+            :func:`build_sequence_plan_from_mode`). Other modes are unaffected.
+            Defaults to 0 (off; draws no randomness).
     """
 
     def __init__(
@@ -575,7 +598,11 @@ class ActionTransformPipeline:
         format_prompt_as_json: bool = False,
         enable_mode_specific_prompt: bool = False,
         format_prompt_float_seconds: bool = False,
+        rtc_max_delay: int = 0,
     ) -> None:
+        if rtc_max_delay < 0:
+            raise ValueError(f"rtc_max_delay must be >= 0, got {rtc_max_delay}")
+        self.rtc_max_delay: int = rtc_max_delay
         self.caption_key: str = caption_key
         self.video_temporal_downsample: int = video_temporal_downsample
         self.max_action_dim: int = max_action_dim
@@ -664,6 +691,12 @@ class ActionTransformPipeline:
                     "cfg_dropout_rate": cfg_dropout_rate,
                 },
             )
+
+    def _draw_rtc_delay(self, mode: str) -> int:
+        """Draw this sample's real-time-chunking delay, uniform in ``0..rtc_max_delay``."""
+        if self.rtc_max_delay == 0 or mode not in ("wam", "policy"):
+            return 0
+        return int(torch.randint(0, self.rtc_max_delay + 1, ()).item())
 
     def _apply_plain_caption_postfixes(self, data_dict: dict, mode: object) -> dict:
         """Append configured plain-caption metadata in one deterministic order."""
@@ -830,6 +863,7 @@ class ActionTransformPipeline:
             action_length=action_length,
             video_temporal_downsample=self.video_temporal_downsample,
             num_history_actions=num_history_actions,
+            rtc_delay=self._draw_rtc_delay(mode),
         )
         data_dict["sequence_plan"] = sequence_plan
 

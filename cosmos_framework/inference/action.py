@@ -76,9 +76,11 @@ def _format_prompt(
     action: torch.Tensor,
     fps: torch.Tensor,
     image_size: torch.Tensor,
+    additional_view_description: str | None = None,
 ) -> str:
     """Helper function to build the action prompt with optional duration and resolution info."""
     data_dict = {
+        "additional_view_description": additional_view_description,
         "viewpoint": view_point,
         "ai_caption": prompt.strip(),
         "video": video,
@@ -108,9 +110,28 @@ def build_action_batch(
     input_video_key: str,
     batch_size: int = 1,
     device: Any = "cuda",
+    action_prefix: torch.Tensor | None = None,
+    additional_view_description: str | None = None,
 ) -> dict:
-    """Build an Action data batch from pre-loaded video and action tensors."""
+    """Build an Action data batch from pre-loaded video and action tensors.
+
+    Args:
+        action_prefix: Real-time-chunking prefix ``[d,raw_action_dim]``, ``wam`` only:
+            the actions the robot has already committed to, in the model's action
+            space. They become the chunk's first ``d`` rows as clean conditioning,
+            and sampling returns them unchanged.
+        additional_view_description: Free-form description of the camera layout,
+            appended to the viewpoint sentence of the caption as the training
+            datasets do (e.g. which camera sits where in ``concat_view``).
+    """
     target_frames = action_chunk_size + 1
+    rtc_delay = 0
+    if action_prefix is not None:
+        if model_mode is not ModelMode.WAM:
+            raise ValueError(f"action_prefix requires model_mode=wam, got {model_mode.value}")
+        rtc_delay, prefix_dim = action_prefix.shape
+        if prefix_dim != raw_action_dim:
+            raise ValueError(f"action_prefix has {prefix_dim} channels, expected raw_action_dim={raw_action_dim}")
     _, num_frames, h, w = video.shape
 
     if num_frames < target_frames:
@@ -133,7 +154,11 @@ def build_action_batch(
         video_length=target_frames,
         action_length=action_chunk_size,
         has_text=True,
+        rtc_delay=rtc_delay,
     )
+    if action_prefix is not None:
+        action = action.clone()  # [T,D_max]
+        action[:rtc_delay, :raw_action_dim] = action_prefix.to(action)
 
     ai_caption = _format_prompt(
         prompt=prompt,
@@ -142,6 +167,7 @@ def build_action_batch(
         action=action,
         fps=torch.tensor(fps, dtype=torch.long),
         image_size=padded_image_size,
+        additional_view_description=additional_view_description,
     )
 
     action_processing_record = ActionProcessingRecord(
