@@ -51,3 +51,27 @@ def test_action_prefix_is_refused_outside_wam_and_beyond_the_chunk() -> None:
         _build(torch.zeros(4, 10))
     with pytest.raises(ValueError, match="rtc_delay=33"):
         _build(torch.zeros(33, 20))
+
+
+@pytest.mark.L0
+def test_additional_view_description_reaches_the_caption() -> None:
+    description = "The scene camera is on top; the left and right wrist cameras are below."
+
+    batch = build_action_batch(
+        video=torch.zeros(3, 1, 64, 64, dtype=torch.uint8),
+        action=torch.zeros(32, 64),
+        raw_action_dim=20,
+        prompt="Fold the towel.",
+        view_point="concat_view",
+        domain_name="robomind-franka-dual",
+        model_mode=ModelMode.WAM,
+        action_chunk_size=32,
+        fps=15,
+        resolution="256",
+        input_video_key="video",
+        device="cpu",
+        additional_view_description=description,
+    )
+
+    assert description in batch["ai_caption"][0]
+    assert description not in _build(None)["ai_caption"][0]

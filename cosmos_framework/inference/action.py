@@ -76,9 +76,11 @@ def _format_prompt(
     action: torch.Tensor,
     fps: torch.Tensor,
     image_size: torch.Tensor,
+    additional_view_description: str | None = None,
 ) -> str:
     """Helper function to build the action prompt with optional duration and resolution info."""
     data_dict = {
+        "additional_view_description": additional_view_description,
         "viewpoint": view_point,
         "ai_caption": prompt.strip(),
         "video": video,
@@ -109,6 +111,7 @@ def build_action_batch(
     batch_size: int = 1,
     device: Any = "cuda",
     action_prefix: torch.Tensor | None = None,
+    additional_view_description: str | None = None,
 ) -> dict:
     """Build an Action data batch from pre-loaded video and action tensors.
 
@@ -117,6 +120,9 @@ def build_action_batch(
             the actions the robot has already committed to, in the model's action
             space. They become the chunk's first ``d`` rows as clean conditioning,
             and sampling returns them unchanged.
+        additional_view_description: Free-form description of the camera layout,
+            appended to the viewpoint sentence of the caption as the training
+            datasets do (e.g. which camera sits where in ``concat_view``).
     """
     target_frames = action_chunk_size + 1
     rtc_delay = 0
@@ -161,6 +167,7 @@ def build_action_batch(
         action=action,
         fps=torch.tensor(fps, dtype=torch.long),
         image_size=padded_image_size,
+        additional_view_description=additional_view_description,
     )
 
     action_processing_record = ActionProcessingRecord(
