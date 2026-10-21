@@ -1,13 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
+import subprocess
+import sys
 from typing import Any
 
 import pytest
 import torch
 from torch.utils.data import Dataset
 
-from cosmos_framework.data.generator.action.datasets.action_sft_dataset import (
+from cosmos_framework.data.generator.action.datasets.action_sft_wrappers import (
     ActionIterableShuffleDataset,
     get_action_external_sft_dataset,
 )
@@ -85,3 +87,16 @@ def test_external_dataset_class_must_exist() -> None:
             dataset_kwargs={},
             resolution="256",
         )
+
+
+@pytest.mark.L0
+def test_wrappers_import_without_the_concrete_datasets_dependencies() -> None:
+    # A downstream package wraps its own dataset without LeRobot or pandas installed.
+    code = (
+        "import sys\n"
+        "sys.modules['lerobot'] = None\n"
+        "sys.modules['pandas'] = None\n"
+        "import cosmos_framework.data.generator.action.datasets.action_sft_wrappers\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr

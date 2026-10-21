@@ -6,34 +6,34 @@
 All concrete datasets inherit from :class:`ActionBaseDataset` and expose a
 ``load_action_stats()`` classmethod for retrieving pre-computed normalization
 statistics without instantiating the dataset.
+
+The datasets are imported on first access, so importing one module of this
+package (e.g. :mod:`.action_sft_wrappers`) does not require the LeRobot and
+pandas dependencies of the concrete datasets.
 """
 
-from cosmos_framework.data.generator.action.datasets.agibotworld_beta_lerobot_dataset import (
-    AgiBotWorldBetaLeRobotDataset,
-)
-from cosmos_framework.data.generator.action.datasets.base_dataset import ActionBaseDataset
-from cosmos_framework.data.generator.action.datasets.bridge_orig_lerobot_dataset import BridgeOrigLeRobotDataset
-from cosmos_framework.data.generator.action.datasets.droid_merged_lerobot_dataset import DROIDMergedLeRobotDataset
-from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset import DROIDLeRobotDataset
-from cosmos_framework.data.generator.action.datasets.fractal_lerobot_dataset import FractalLeRobotDataset
-from cosmos_framework.data.generator.action.datasets.human_hand_pose_lerobot_dataset import HumanHandPoseLeRobotDataset
-from cosmos_framework.data.generator.action.datasets.robocasa_lerobot_dataset import RoboCasaLeRobotDataset
-from cosmos_framework.data.generator.action.datasets.libero_lerobot_dataset import LIBEROLeRobotDataset
-from cosmos_framework.data.generator.action.datasets.robomind_franka_dataset import RoboMINDFrankaDataset
-from cosmos_framework.data.generator.action.datasets.robomind_ur_dataset import RoboMINDURDataset
-from cosmos_framework.data.generator.action.datasets.umi_lerobot_dataset import UMILeRobotDataset
+import importlib
+from typing import Any
 
-__all__ = [
-    "ActionBaseDataset",
-    "AgiBotWorldBetaLeRobotDataset",
-    "BridgeOrigLeRobotDataset",
-    "DROIDLeRobotDataset",
-    "DROIDMergedLeRobotDataset",
-    "FractalLeRobotDataset",
-    "HumanHandPoseLeRobotDataset",
-    "RoboCasaLeRobotDataset",
-    "LIBEROLeRobotDataset",
-    "RoboMINDFrankaDataset",
-    "RoboMINDURDataset",
-    "UMILeRobotDataset",
-]
+_MODULE_BY_NAME = {
+    "ActionBaseDataset": "base_dataset",
+    "AgiBotWorldBetaLeRobotDataset": "agibotworld_beta_lerobot_dataset",
+    "BridgeOrigLeRobotDataset": "bridge_orig_lerobot_dataset",
+    "DROIDLeRobotDataset": "droid_lerobot_dataset",
+    "DROIDMergedLeRobotDataset": "droid_merged_lerobot_dataset",
+    "FractalLeRobotDataset": "fractal_lerobot_dataset",
+    "HumanHandPoseLeRobotDataset": "human_hand_pose_lerobot_dataset",
+    "LIBEROLeRobotDataset": "libero_lerobot_dataset",
+    "RoboCasaLeRobotDataset": "robocasa_lerobot_dataset",
+    "RoboMINDFrankaDataset": "robomind_franka_dataset",
+    "RoboMINDURDataset": "robomind_ur_dataset",
+    "UMILeRobotDataset": "umi_lerobot_dataset",
+}
+
+__all__ = sorted(_MODULE_BY_NAME)
+
+
+def __getattr__(name: str) -> Any:
+    if name not in _MODULE_BY_NAME:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(importlib.import_module(f"{__name__}.{_MODULE_BY_NAME[name]}"), name)
