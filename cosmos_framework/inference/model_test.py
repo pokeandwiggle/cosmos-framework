@@ -227,6 +227,53 @@ def test_from_pretrained_dcp_installs_modelopt_fp8_after_load(tmp_path: Path) ->
     assert converted_targets == [model.model.net]
 
 
+def test_from_pretrained_dcp_quantizes_per_layer_after_the_host_load(tmp_path: Path) -> None:
+    events: list[str] = []
+    quantization_config = QuantizationConfig(method="fp8", quantize_per_layer_at_load=True)
+
+    def record_quantize(model: object, config: QuantizationConfig, device: object) -> list[str]:
+        del device
+        assert config is quantization_config
+        events.append("quantize")
+        return []
+
+    with (
+        patch.object(CheckpointType, "from_path", return_value=CheckpointType.HF),
+        patch("cosmos_framework.inference.model._is_diffusers_checkpoint", return_value=True),
+        patch("cosmos_framework.inference.model.is_modelopt_fp8_checkpoint", return_value=False),
+        patch("cosmos_framework.inference.model.get_model_state_dict", return_value={}),
+        patch("cosmos_framework.inference.model._DiffusersHuggingFaceStorageReader"),
+        patch("cosmos_framework.inference.model._DiffusersLoadPlanner"),
+        patch("cosmos_framework.inference.model.dcp.load", side_effect=lambda **_: events.append("load")),
+        patch("cosmos_framework.inference.model.quantize_per_layer_to_device", side_effect=record_quantize),
+    ):
+        LightweightDcpModel.from_pretrained_dcp(
+            checkpoint_path=tmp_path, config=Cosmos3OmniConfig(), quantization_config=quantization_config
+        )
+
+    assert events == ["load", "quantize"]
+
+
+@pytest.mark.parametrize(
+    ("quantization_config", "modelopt", "message"),
+    [
+        (QuantizationConfig(quantize_per_layer_at_load=True), False, "requires a quantization method"),
+        (QuantizationConfig(method="fp8", quantize_per_layer_at_load=True), True, "already quantized"),
+    ],
+)
+def test_from_pretrained_dcp_refuses_per_layer_load_it_cannot_do(
+    tmp_path: Path, quantization_config: QuantizationConfig, modelopt: bool, message: str
+) -> None:
+    with (
+        patch("cosmos_framework.inference.model._is_diffusers_checkpoint", return_value=True),
+        patch("cosmos_framework.inference.model.is_modelopt_fp8_checkpoint", return_value=modelopt),
+        pytest.raises(ValueError, match=message),
+    ):
+        LightweightDcpModel.from_pretrained_dcp(
+            checkpoint_path=tmp_path, config=Cosmos3OmniConfig(), quantization_config=quantization_config
+        )
+
+
 def test_from_pretrained_dcp_rejects_modelopt_fp8_with_runtime_quantization(tmp_path: Path) -> None:
     with patch("cosmos_framework.inference.model.is_modelopt_fp8_checkpoint", return_value=True):
         with pytest.raises(ValueError, match="already quantized"):

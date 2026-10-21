@@ -44,11 +44,12 @@ from cosmos_framework.inference.common.public_model_config import (
     restore_model_config_from_public_model_config,
 )
 from cosmos_framework.utils import misc
-from cosmos_framework.utils.flags import SMOKE
+from cosmos_framework.utils.flags import DEVICE, SMOKE
 from cosmos_framework.utils.generator.quantization import (
     apply_modelopt_fp8_checkpoint_inplace,
     is_modelopt_fp8_checkpoint,
     plan_modelopt_fp8_targets,
+    quantize_per_layer_to_device,
 )
 
 if TYPE_CHECKING:
@@ -709,6 +710,17 @@ class Cosmos3OmniModel(transformers.PreTrainedModel):
                 weight_map=_diffusers_weight_map(checkpoint_path),
             )
 
+        if quantization_config.quantize_per_layer_at_load:
+            _dist = torch.distributed
+            if quantization_config.method is None:
+                raise ValueError("quantize_per_layer_at_load requires a quantization method")
+            if modelopt_checkpoint or not _is_diffusers_checkpoint(checkpoint_path):
+                raise ValueError(
+                    f"quantize_per_layer_at_load requires a bf16 diffusers-format checkpoint: {checkpoint_path}"
+                )
+            if _dist.is_available() and _dist.is_initialized() and _dist.get_world_size() > 1:
+                raise ValueError("quantize_per_layer_at_load supports a single replicated rank only")
+
         model = cls(config)
         # Thread the local checkpoint dir to the reasoner LM (consumed by Edge's
         # lazy ``_ensure_vision_tower``): checkpoints that bundle a
@@ -757,6 +769,9 @@ class Cosmos3OmniModel(transformers.PreTrainedModel):
                         )
 
                         install_mixed_precision_runtime(model.model.net, quantization_config)
+                    if quantization_config.quantize_per_layer_at_load:
+                        # build_net left the network on the host, now loaded.
+                        quantize_per_layer_to_device(model.model.net, quantization_config, DEVICE)
                     return model
                 state_dict = get_model_state_dict(model)
                 _raise_on_missing_vision_keys(checkpoint_path, state_dict)

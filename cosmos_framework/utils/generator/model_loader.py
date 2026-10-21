@@ -420,6 +420,8 @@ def load_model_from_checkpoint(
 
     quantization_config_obj = QuantizationConfig(**quantization_config)
     quantization_method = quantization_config_obj.method
+    if quantization_config_obj.quantize_per_layer_at_load:
+        raise ValueError("quantize_per_layer_at_load is supported by Cosmos3OmniModel.from_pretrained_dcp only")
     if quantization_method is not None:
         dp_shard_degree = config.model.config.parallelism.data_parallel_shard_degree
         if dp_shard_degree > 1:

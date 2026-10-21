@@ -645,6 +645,13 @@ class OmniMoTModel(ImaginaireModel):
             mp_policy=mp_policy,
         )
 
+        if self.config.quantization.quantize_per_layer_at_load:
+            # The loader fills these host weights and then moves them to the GPU
+            # module by module, quantizing as it goes (quantize_per_layer_to_device).
+            net.to_empty(device="cpu")  # parameters and buffers: [*shape]
+            net.init_weights(buffer_device=torch.device("cpu"))
+            return net
+
         with misc.timer("meta to cuda and broadcast model states"):
             if self.config.parallelism.fsdp_cpu_offload:
                 materialize_non_offloaded_state(net, device=DEVICE)
