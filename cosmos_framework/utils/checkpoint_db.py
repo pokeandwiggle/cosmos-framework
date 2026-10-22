@@ -67,6 +67,16 @@ from cosmos_framework.utils import log
 
 _HF_CLI_PROJECT = Path(__file__).resolve().with_name("hf_cli")
 
+LOCAL_SNAPSHOTS_ENV = "COSMOS_HF_LOCAL_SNAPSHOTS"
+"""Environment variable mapping Hugging Face repositories to local directories.
+
+Its value is a JSON object, e.g. ``{"nvidia/Cosmos3-Nano": "/abs/dir"}``. A mapped
+repository is never fetched: every ``CheckpointHf`` download of it, and every
+``config_variant="hf"`` tokenizer download, resolves inside that directory instead,
+whatever revision the caller names. The directory then pins the repository's
+contents, so it must hold what each caller reads from it, laid out as in the repo.
+"""
+
 
 def _is_uuid(checkpoint_uri: str) -> bool:
     """Return True if the URI is a UUID."""
@@ -183,6 +193,28 @@ def _hf_download(cmd_args: list[str]) -> str:
     return json.loads(output.stdout)["path"]
 
 
+def local_snapshot(repository: str) -> Path | None:
+    """Return the local directory ``COSMOS_HF_LOCAL_SNAPSHOTS`` maps ``repository`` to.
+
+    None when the variable is unset or does not name the repository. Raises when
+    the variable is malformed or the mapped directory does not exist.
+    """
+    raw = os.environ.get(LOCAL_SNAPSHOTS_ENV)
+    if raw is None:
+        return None
+    snapshots = json.loads(raw)
+    if not isinstance(snapshots, dict) or not all(isinstance(v, str) for v in snapshots.values()):
+        raise ValueError(f"{LOCAL_SNAPSHOTS_ENV} must be a JSON object of repository to directory, got {raw!r}")
+    if repository not in snapshots:
+        return None
+    path = Path(snapshots[repository])
+    if not path.is_absolute() or not path.is_dir():
+        raise FileNotFoundError(
+            f"{LOCAL_SNAPSHOTS_ENV} maps '{repository}' to '{path}', which is not an absolute directory"
+        )
+    return path
+
+
 class RepositoryType(StrEnum):
     """Repository type."""
 
@@ -208,10 +240,28 @@ class _CheckpointHf(_CheckpointUri, ABC):
     @abstractmethod
     def _download(self) -> str: ...
 
+    @abstractmethod
+    def _relative_path(self) -> str:
+        """Path of the downloaded file or directory relative to the repository root."""
+
     def download(self) -> str:
-        """Download checkpoint and return the local path."""
+        """Download checkpoint and return the local path.
+
+        A repository mapped by ``COSMOS_HF_LOCAL_SNAPSHOTS`` resolves inside its
+        local directory instead, and the requested file or directory must be there.
+        """
         if self._path is None:
-            self._path = self._download()
+            snapshot = local_snapshot(self.repository)
+            if snapshot is None:
+                self._path = self._download()
+            else:
+                path = snapshot / self._relative_path()
+                if not path.exists():
+                    raise FileNotFoundError(
+                        f"{LOCAL_SNAPSHOTS_ENV} maps '{self.repository}' to '{snapshot}', "
+                        f"which has no '{self._relative_path()}'"
+                    )
+                self._path = str(path)
         return self._path
 
 
@@ -220,6 +270,10 @@ class CheckpointFileHf(_CheckpointHf):
 
     filename: str
     """File name."""
+
+    @override
+    def _relative_path(self) -> str:
+        return self.filename
 
     @override
     def _download(self) -> str:
@@ -252,6 +306,10 @@ class CheckpointDirHf(_CheckpointHf):
 
     See https://huggingface.co/docs/huggingface_hub/en/guides/download#filter-files-to-download
     """
+
+    @override
+    def _relative_path(self) -> str:
+        return self.subdirectory
 
     @override
     def _download(self) -> str:
