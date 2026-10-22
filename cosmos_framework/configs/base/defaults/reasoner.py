@@ -55,7 +55,10 @@ def get_rank_safe() -> int:
 # Download to ~/.cache/imaginaire4/tokenizer_files/{model_name} and then load from there.
 def download_tokenizer_files(model_name: str, config_variant: str) -> str:
     if config_variant == "hf":
-        return model_name
+        from cosmos_framework.utils.checkpoint_db import local_snapshot
+
+        snapshot = local_snapshot(model_name)
+        return model_name if snapshot is None else str(snapshot)
 
     if config_variant == "s3":
         ckpt_bucket = "bucket4"
