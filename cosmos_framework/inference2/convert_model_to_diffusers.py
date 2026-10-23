@@ -86,6 +86,7 @@ def _build_public_export_model_config(model_dict: dict[str, Any]) -> dict[str, A
             "modelopt_fp8_target_fqns": [],
             "mixed_precision_first_steps": 0,
             "mixed_precision_last_steps": 0,
+            "quantize_per_layer_at_load": False,
         }
         # ``fp8_granularity`` is inert when quantization is disabled (method=None),
         # and the mixed-precision policy/cache selectors are inert while
