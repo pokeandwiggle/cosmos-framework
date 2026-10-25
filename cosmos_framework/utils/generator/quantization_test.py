@@ -11,6 +11,9 @@ from torch import nn
 
 from cosmos_framework.configs.base.defaults.quantization import QuantizationConfig
 from cosmos_framework.utils.generator.quantization import (
+    FP8_ACTIVATION_AMAX_FLOOR,
+    _quantize_linear,
+    _torchao_config,
     apply_modelopt_fp8_checkpoint_inplace,
     is_modelopt_fp8_checkpoint,
     quantize_per_layer_to_device,
@@ -264,3 +267,25 @@ def test_quantize_per_layer_to_device_never_holds_two_bf16_linears_on_device() -
 def test_quantize_per_layer_to_device_requires_a_method() -> None:
     with pytest.raises(ValueError, match="method"):
         quantize_per_layer_to_device(nn.Linear(4, 4), QuantizationConfig(), "meta")
+
+
+@pytest.mark.parametrize("granularity", ["per_row", "per_tensor"])
+def test_fp8_floors_the_activation_amax(granularity: str) -> None:
+    config = _torchao_config(QuantizationConfig(method="fp8", fp8_granularity=granularity))
+    assert config.activation_value_lb == FP8_ACTIVATION_AMAX_FLOOR > 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="torchao's FP8 kernels need CUDA sm_89+",
+)
+def test_fp8_keeps_an_all_zero_activation_row_finite() -> None:
+    linear = nn.Linear(64, 64, bias=False, device="cuda", dtype=torch.bfloat16)
+    _quantize_linear(linear, QuantizationConfig(method="fp8"))
+    inputs = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)  # [B,D]
+    inputs[1] = 0
+
+    outputs = linear(inputs)  # [B,D]
+
+    assert torch.isfinite(outputs).all()
+    assert (outputs[1] == 0).all()
