@@ -739,6 +739,10 @@ def _get_validated_quantization_fqns(model: nn.Module, filter_fn: Callable[[nn.M
     return matched_fqns
 
 
+#: The least activation amax an fp8 scale is computed from (torchao's float8 EPS).
+FP8_ACTIVATION_AMAX_FLOOR = 1e-12
+
+
 def _torchao_config(quantization_config: QuantizationConfig) -> object:
     """Return the torchao ``quantize_`` config for ``quantization_config.method``."""
     from torchao.prototype.mx_formats import (
@@ -769,7 +773,12 @@ def _torchao_config(quantization_config: QuantizationConfig) -> object:
         # better accuracy) or PerTensor (single scale, slightly faster); both are
         # supported on Hopper.
         granularity = PerRow() if quantization_config.fp8_granularity == "per_row" else PerTensor()
-        return Float8DynamicActivationFloat8WeightConfig(granularity=granularity)
+        # The activation scale is amax / 448, so an all-zero row (a padding token)
+        # would scale by 0 and quantize to 0 / 0 = NaN, which attention then spreads
+        # to every token. Floor amax as torchao's float8 training does.
+        return Float8DynamicActivationFloat8WeightConfig(
+            granularity=granularity, activation_value_lb=FP8_ACTIVATION_AMAX_FLOOR
+        )
     raise ValueError(f"Unsupported quantization method: {quantization_config.method}")
 
 
